@@ -1,2 +1,4 @@
 # Project exclude paths
 /.aws-sam/
+.idea
+*.iml
