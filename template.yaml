@@ -1,0 +1,287 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  video-bedrock-knowledgebase
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 512
+    Runtime: java11
+    Architectures:
+      - x86_64
+    Environment: # More info about Env Vars: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#environment-object
+      Variables:
+        JAVA_TOOL_OPTIONS: -XX:+TieredCompilation -XX:TieredStopAtLevel=1  -XX:MetaspaceSize=128m -XX:MaxMetaspaceSize=512m # More info about tiered compilation https://aws.amazon.com/blogs/compute/optimizing-aws-lambda-function-performance-for-java/
+
+Resources:
+  ### Transcription Lambda Function
+  TranscriptionJobInvokation:
+    Type: AWS::Serverless::Function
+    Properties:
+      Role: !GetAtt TranscriptionJobInvokationRole.Arn
+      FunctionName: transcription-job-invokation
+      CodeUri: transcription-job-invokation
+      Handler: com.whysurfswim.TranscriptionJobInvokation::handleRequest
+      Environment:
+        Variables:
+          TRANSCRIPTION_QUEUE: !GetAtt TranscriptionQueue.Arn
+          VIDEO_OUTPUT_BUCKET_NAME: !Ref TranscribedOutputBucket
+      Events:
+        TranscriptionSQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TranscriptionQueue.Arn
+            BatchSize: 1
+            Enabled: true
+            ScalingConfig:
+              MaximumConcurrency: 2
+
+  TranscriptionJobInvokationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+        Version: 2012-10-17
+      Policies:
+        - PolicyName: TranscriptionJobInvokationRolePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - transcribe:StartTranscriptionJob
+                Resource: "*"
+        - PolicyName: TranscriptionJobInvokationS3Policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                - !Join
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Ref TranscribedOutputBucket
+                    - '/*'
+                - !Join
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Ref VideoInputBucket
+                    - '/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                - !Join
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Ref TranscribedOutputBucket
+                - !Join
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Ref VideoInputBucket
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+
+  TranscriptionJobInvokationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${TranscriptionJobInvokation}"
+      RetentionInDays: 7
+
+  ### Video Input S3
+  VideoInputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub video-input-bucket-${AWS::AccountId}-${AWS::Region}
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  ### Transcription SQS
+  TranscriptionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: TranscriptionQueue
+
+  ### Video Input EventRule
+  VideoInputEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: !Sub Wildcard filter pattern on object create events on bucket s3://${VideoInputBucket}
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref VideoInputBucket
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt TranscriptionQueue.Arn
+          Id: TranscriptionQueueTarget
+
+  ### Transcription SQS Queue Policy
+  TranscriptionQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref TranscriptionQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt TranscriptionQueue.Arn
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !GetAtt VideoInputEventRule.Arn
+
+  ### Transcribed output s3
+  TranscribedOutputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub transcribed-output-${AWS::AccountId}-${AWS::Region}
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  ### SSM Parameter to store the knowledge base id as csv
+  KnowledgeBaseIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /poc/bedrock/knowledgebaseid
+      Type: String
+      Value: "kbId"
+
+  ### Transcription SQS
+  KnowledgeBaseSyncQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: KnowledgeBaseSyncQueue
+
+  ### KnowledgeBase Sync EventRule
+  KnowledgeBaseSyncEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: !Sub Wildcard filter pattern on object create events on bucket s3://${TranscribedOutputBucket}
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref TranscribedOutputBucket
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt KnowledgeBaseSyncQueue.Arn
+          Id: KnowledgeBaseSyncQueueTarget
+
+  ### KnowledgeBaseSync SQS Queue Policy
+  KnowledgeBaseSyncQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref KnowledgeBaseSyncQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt KnowledgeBaseSyncQueue.Arn
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !GetAtt KnowledgeBaseSyncEventRule.Arn
+
+  ### KnowledgeBaseSync Lambda Function
+  KnowledgeBaseSync:
+    Type: AWS::Serverless::Function
+    Properties:
+      Role: !GetAtt KnowledgeBaseSyncRole.Arn
+      FunctionName: knowledge-base-sync
+      CodeUri: knowledge-base-sync
+      Handler: com.whysurfswim.KnowledgeBaseSync::handleRequest
+      Environment:
+        Variables:
+          KNOWLEDGEBASESYNC_QUEUE: !GetAtt KnowledgeBaseSyncQueue.Arn
+          KNOWLEDGEBASEID_PARAMETER: !Ref KnowledgeBaseIdParameter
+      Events:
+        KnowledgeBaseSyncSQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt KnowledgeBaseSyncQueue.Arn
+            BatchSize: 2 #accomodating for .tmp file while creating transcription file
+            Enabled: true
+            ScalingConfig:
+              MaximumConcurrency: 2
+
+  KnowledgeBaseSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+        Version: 2012-10-17
+      Policies:
+        - PolicyName: KnowledgeBaseSyncPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:StartIngestionJob
+                  - bedrock:ListDataSources
+                  - bedrock:GetDataSource
+                  - ssm:GetParameter
+                Resource: "*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+
+  KnowledgeBaseSyncLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${KnowledgeBaseSync}"
+      RetentionInDays: 7
+
+
+
+
+Outputs:
+  VideoInputBucketName:
+    Value: !Ref VideoInputBucket
+
+  TranscribedOutputBucketName:
+    Value: !Ref TranscribedOutputBucket
+
+  TranscriptionQueueName:
+    Value: !GetAtt TranscriptionQueue.QueueName
+
+  KnowledgeBaseSyncQueueName:
+    Value: !GetAtt KnowledgeBaseSyncQueue.QueueName
+
+  KnowledgeBaseIdParameterName:
+    Value: !Ref KnowledgeBaseIdParameter
